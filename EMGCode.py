@@ -4,6 +4,7 @@ from tkinter import ttk
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from scipy.ndimage import gaussian_filter1d
 from hmmlearn import hmm
 
 np.random.seed(42)
@@ -23,92 +24,73 @@ shoulder_imu = 0.2 * phase + 0.02 * np.random.randn(N)
 forearm_imu  = 1.5 * phase + 0.1 * np.random.randn(N)
 
 # ─────────────────────────────────────────────
-# FEATURE ENGINEERING
-# 5 features — 3 directional, 2 energy
+# INTENT PROBABILITIES — physics-driven
 #
-# Directional (signed, tell flex from ext):
-#   signed_vel    : +ve during flexion, -ve during extension
-#   muscle_signed : biceps - triceps, +ve during flexion
-#   forearm_signed: forearm IMU signed mean, +ve during flexion
+# Velocity tells us exactly what's happening:
+#   +ve velocity → angle increasing → FLEXION
+#   -ve velocity → angle decreasing → EXTENSION
+#   ~zero        → REST
 #
-# Energy (magnitude, separate motion from rest):
-#   vel_mag       : |velocity| — near zero at rest
-#   emg_activity  : |biceps - triceps| — near zero at rest
+# Strategy:
+#   1. Smooth velocity to reduce noise
+#   2. Split into positive (flex) and negative (ext) components
+#   3. Normalise each to [0,1] via sigmoid-like scaling
+#   4. Use HMM to smooth the state sequence and remove jitter
 # ─────────────────────────────────────────────
-def extract_features(b, tr, f, v, window=12):
-    feats = []
-    for i in range(len(b) - window):
-        bw = b[i:i+window]
-        tw = tr[i:i+window]
-        fw = f[i:i+window]
-        vw = v[i:i+window]
 
-        signed_vel     =  np.mean(vw)               # direction of motion
-        muscle_signed  =  np.mean(bw) - np.mean(tw) # +ve = biceps dominant = flexion
-        forearm_signed =  np.mean(fw)               # signed forearm displacement
-        vel_mag        =  np.mean(np.abs(vw))       # energy — separates rest from motion
-        emg_activity   =  np.abs(np.mean(bw) - np.mean(tw))  # muscle engagement level
+# Smooth velocity (sigma=4 ≈ one window width)
+vel_smooth = gaussian_filter1d(velocity, sigma=4)
 
-        feats.append([signed_vel, muscle_signed, forearm_signed, vel_mag, emg_activity])
-    return np.array(feats)
+# Positive part = flexion drive, negative part = extension drive
+flex_drive = np.clip(vel_smooth,  0, None)   # zero out negatives
+ext_drive  = np.clip(-vel_smooth, 0, None)   # zero out positives (flip sign)
 
-features = extract_features(biceps, triceps, forearm_imu, velocity)
+# Normalise to [0,1]
+flex_drive = flex_drive / (flex_drive.max() + 1e-8)
+ext_drive  = ext_drive  / (ext_drive.max()  + 1e-8)
 
-# ─────────────────────────────────────────────
-# NORMALISE features so HMM sees balanced scale
-# ─────────────────────────────────────────────
-feat_mean = features.mean(axis=0)
-feat_std  = features.std(axis=0) + 1e-8
-features_norm = (features - feat_mean) / feat_std
+# ── HMM over velocity-derived labels for temporal smoothing ──────────────────
+# Build a 3-feature observation: [flex_drive, ext_drive, |vel_smooth| / max]
+vel_mag_norm = np.abs(vel_smooth) / (np.abs(vel_smooth).max() + 1e-8)
+obs = np.column_stack([flex_drive, ext_drive, vel_mag_norm])
 
-# ─────────────────────────────────────────────
-# HMM — 3 STATES
-# Initialise means to push states apart from the start
-# so EM doesn't collapse flexion and extension together
-# ─────────────────────────────────────────────
 model = hmm.GaussianHMM(
     n_components=3,
-    covariance_type="full",
-    n_iter=500,
-    init_params="stmc",   # let us set means manually
+    covariance_type="diag",
+    n_iter=200,
+    init_params="stmc",
     params="stmc"
 )
 
-# Warm-start means:
-#   state 0 = REST     → all features near 0
-#   state 1 = FLEXION  → signed features strongly positive
-#   state 2 = EXTENSION→ signed features strongly negative
+# Warm-start: REST=flat, FLEXION=flex dominant, EXTENSION=ext dominant
 model.startprob_ = np.array([0.34, 0.33, 0.33])
 model.transmat_  = np.array([
-    [0.90, 0.05, 0.05],
-    [0.05, 0.90, 0.05],
-    [0.05, 0.05, 0.90],
+    [0.92, 0.04, 0.04],
+    [0.04, 0.92, 0.04],
+    [0.04, 0.04, 0.92],
 ])
 model.means_ = np.array([
-    [ 0.0,  0.0,  0.0,  0.0,  0.0],   # REST
-    [ 1.5,  1.5,  1.5,  1.5,  1.5],   # FLEXION  — positive direction
-    [-1.5, -1.5, -1.5,  1.5,  1.5],   # EXTENSION— negative direction, still active
+    [0.05, 0.05, 0.05],   # REST     — low on everything
+    [0.85, 0.05, 0.85],   # FLEXION  — high flex, low ext
+    [0.05, 0.85, 0.85],   # EXTENSION— low flex, high ext
 ])
-model.covars_ = np.tile(np.eye(5) * 0.5, (3, 1, 1))
+model.covars_ = np.tile(np.array([[0.02, 0.02, 0.02]]), (3, 1))
 
-model.fit(features_norm)
-probs = model.predict_proba(features_norm)   # (288, 3)
+model.fit(obs)
+probs = model.predict_proba(obs)   # (N, 3)
 
-# ─────────────────────────────────────────────
-# IDENTIFY STATES POST-TRAINING
-# signed_vel is feature 0 — most reliable direction indicator
-# vel_mag    is feature 3 — separates rest from motion
-# ─────────────────────────────────────────────
-signed_vel_means = model.means_[:, 0]
-vel_mag_means    = model.means_[:, 3]
+# Identify states: flex_drive mean is feature 0, ext_drive is feature 1
+flex_means = model.means_[:, 0]
+ext_means  = model.means_[:, 1]
+mag_means  = model.means_[:, 2]
 
-rest_state      = int(np.argmin(vel_mag_means))
+rest_state      = int(np.argmin(mag_means))
 remaining       = [i for i in range(3) if i != rest_state]
-flexion_state   = remaining[int(np.argmax(signed_vel_means[remaining]))]
-extension_state = remaining[int(np.argmin(signed_vel_means[remaining]))]
+flexion_state   = remaining[int(np.argmax(flex_means[remaining]))]
+extension_state = remaining[int(np.argmin(flex_means[remaining]))]
 
-flex_prob = np.pad(probs[:, flexion_state],   (0, N - len(probs)), 'edge')
-ext_prob  = np.pad(probs[:, extension_state], (0, N - len(probs)), 'edge')
+flex_prob = probs[:, flexion_state]
+ext_prob  = probs[:, extension_state]
 
 # ─────────────────────────────────────────────
 # THEME
